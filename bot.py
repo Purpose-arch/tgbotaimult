@@ -11,22 +11,18 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BASE_URL = "https://openrouter.ai/api/v1"
 HISTORY_LIMIT = 10
 
-
 if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY не найден в .env")
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN не найден в .env")
-
 
 class Database:
     def __init__(self):
@@ -73,7 +69,6 @@ class Database:
 
 db = Database()
 
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -83,9 +78,9 @@ client = AsyncOpenAI(
 )
 
 MODELS = {
-    "qwen/qwen2.5-vl-72b-instruct:free": "Qwen VL 72B",
-    "cognitivecomputations/dolphin3.0-r1-mistral-24b:free": "Dolphin 3.0 Mistral 24B",
-    "google/gemini-exp-1206:free": "Gemini Experimental"
+    "qwen/qwen2.5-vl-72b-instruct:free": "Qwen 2.5",
+    "deepseek/deepseek-r1:free": "Deepseek R1",
+    "google/gemini-exp-1206:free": "Gemini Exp. 1206"
 }
 
 class ChatStates(StatesGroup):
@@ -111,9 +106,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def model_selected(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     model_key = [k for k, v in MODELS.items() if v == message.text][0]
-    
-    # Загрузка истории из БД
-    history = db.get_history(user_id)
     
     await state.update_data(model=model_key)
     await state.set_state(ChatStates.waiting_for_message)
@@ -142,28 +134,44 @@ async def handle_message(message: types.Message, state: FSMContext):
         await message.answer("Сначала выберите модель!")
         return
     
-    
     db.add_message(user_id, "user", message.text)
     
     try:
-        
         history = db.get_history(user_id)
         
-        response = await client.chat.completions.create(
+        # Отправляем начальное сообщение с анимацией печати
+        sent_message = await message.answer("▌")
+        full_answer = ""
+        
+        # Создаем потоковый ответ
+        stream = await client.chat.completions.create(
             model=model,
             messages=history + [{"role": "user", "content": message.text}],
+            stream=True,
             extra_headers={
                 "HTTP-Referer": "https://github.com/Purpose-arch/tgbotaimult",
                 "X-Title": "tgbotaimult"
             }
         )
         
-        answer = response.choices[0].message.content
+        # Обрабатываем потоковые данные
+        async for chunk in stream:
+            if chunk.choices[0].delta.content:
+                delta_content = chunk.choices[0].delta.content
+                full_answer += delta_content
+                
+                # Обновляем сообщение каждые 3 символа для оптимизации
+                if len(full_answer) % 3 == 0 or len(delta_content) < 3:
+                    try:
+                        await sent_message.edit_text(full_answer + "▌")
+                    except Exception as e:
+                        logger.error(f"Ошибка при обновлении сообщения: {e}")
         
+        # Убираем анимацию печати и сохраняем финальный ответ
+        await sent_message.edit_text(full_answer)
+        db.add_message(user_id, "assistant", full_answer)
         
-        db.add_message(user_id, "assistant", answer)
-        
-        
+        # Очищаем старую историю
         cursor = db.conn.cursor()
         cursor.execute('''
             DELETE FROM history 
@@ -175,8 +183,6 @@ async def handle_message(message: types.Message, state: FSMContext):
             )
         ''', (user_id, HISTORY_LIMIT))
         db.conn.commit()
-        
-        await message.answer(answer)
         
     except Exception as e:
         logger.error(f"Ошибка: {str(e)}")
