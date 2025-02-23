@@ -1,6 +1,8 @@
 import os
 import logging
 import sqlite3
+import asyncio
+import time
 from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -138,12 +140,18 @@ async def handle_message(message: types.Message, state: FSMContext):
     
     try:
         history = db.get_history(user_id)
-        
-        # Отправляем начальное сообщение с анимацией печати
         sent_message = await message.answer("▌")
         full_answer = ""
+        last_edit_time = time.monotonic()
+        edit_interval = 1.5
+        event = asyncio.Event()
+        thinking_task = None
         
-        # Создаем потоковый ответ
+        if model == "deepseek/deepseek-r1:free":
+            thinking_task = asyncio.create_task(
+                show_thinking_indication(sent_message, event)
+            )
+        
         stream = await client.chat.completions.create(
             model=model,
             messages=history + [{"role": "user", "content": message.text}],
@@ -154,24 +162,45 @@ async def handle_message(message: types.Message, state: FSMContext):
             }
         )
         
-        # Обрабатываем потоковые данные
+        first_chunk = True
         async for chunk in stream:
+            if first_chunk:
+                event.set()
+                if thinking_task and not thinking_task.done():
+                    thinking_task.cancel()
+                first_chunk = False
+            
             if chunk.choices[0].delta.content:
                 delta_content = chunk.choices[0].delta.content
                 full_answer += delta_content
-                
-                # Обновляем сообщение каждые 3 символа для оптимизации
-                if len(full_answer) % 3 == 0 or len(delta_content) < 3:
+                now = time.monotonic()
+                if now - last_edit_time >= edit_interval or len(delta_content) < 3:
                     try:
                         await sent_message.edit_text(full_answer + "▌")
+                        last_edit_time = now
                     except Exception as e:
-                        logger.error(f"Ошибка при обновлении сообщения: {e}")
+                        error_str = str(e)
+                        if "Too Many Requests" in error_str:
+                            wait_time = 1
+                            try:
+                                import re
+                                match = re.search(r"retry after (\d+)", error_str)
+                                if match:
+                                    wait_time = int(match.group(1))
+                            except Exception:
+                                pass
+                            await asyncio.sleep(wait_time)
+                            try:
+                                await sent_message.edit_text(full_answer + "▌")
+                                last_edit_time = time.monotonic()
+                            except Exception as inner_e:
+                                logger.error(f"Ошибка повторного обновления: {inner_e}")
+                        else:
+                            logger.error(f"Ошибка при обновлении сообщения: {e}")
         
-        # Убираем анимацию печати и сохраняем финальный ответ
         await sent_message.edit_text(full_answer)
         db.add_message(user_id, "assistant", full_answer)
         
-        # Очищаем старую историю
         cursor = db.conn.cursor()
         cursor.execute('''
             DELETE FROM history 
@@ -187,7 +216,18 @@ async def handle_message(message: types.Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Ошибка: {str(e)}")
         await message.answer("⚠️ Произошла ошибка при обработке запроса")
+        if thinking_task and not thinking_task.done():
+            thinking_task.cancel()
+
+async def show_thinking_indication(sent_message: types.Message, event: asyncio.Event):
+    try:
+        await asyncio.sleep(2)
+        if not event.is_set():
+            await sent_message.edit_text("🤔 думаю...")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.error(f"Ошибка в задаче Thinking: {e}")
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(dp.start_polling(bot))
