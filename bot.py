@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from openai import AsyncOpenAI
 
 load_dotenv()
@@ -16,6 +16,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Конфигурация
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BASE_URL = "https://openrouter.ai/api/v1"
@@ -34,39 +35,79 @@ class Database:
     def _create_tables(self):
         cursor = self.conn.cursor()
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS history (
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
-                timestamp DATETIME,
+                model TEXT,
+                created_at DATETIME,
+                title TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS history (
+                message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
                 role TEXT,
-                content TEXT
+                content TEXT,
+                timestamp DATETIME
             )
         ''')
         self.conn.commit()
 
-    def add_message(self, user_id: int, role: str, content: str):
+    def create_chat(self, user_id: int, model: str, title: str):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT INTO history (user_id, timestamp, role, content)
+            INSERT INTO chats (user_id, model, created_at, title)
             VALUES (?, ?, ?, ?)
-        ''', (user_id, datetime.now(), role, content))
+        ''', (user_id, model, datetime.now(), title))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_chats(self, user_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT chat_id, title, model FROM chats 
+            WHERE user_id = ? 
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        return cursor.fetchall()
+
+    def delete_chat(self, chat_id: int):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM chats WHERE chat_id = ?', (chat_id,))
+        cursor.execute('DELETE FROM history WHERE chat_id = ?', (chat_id,))
         self.conn.commit()
 
-    def get_history(self, user_id: int, limit: int = HISTORY_LIMIT):
+    def rename_chat(self, chat_id: int, new_title: str):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE chats SET title = ? 
+            WHERE chat_id = ?
+        ''', (new_title, chat_id))
+        self.conn.commit()
+
+    def add_message(self, chat_id: int, role: str, content: str):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO history (chat_id, role, content, timestamp)
+            VALUES (?, ?, ?, ?)
+        ''', (chat_id, role, content, datetime.now()))
+        self.conn.commit()
+
+    def get_history(self, chat_id: int, limit: int = HISTORY_LIMIT):
         cursor = self.conn.cursor()
         cursor.execute('''
             SELECT role, content FROM history 
-            WHERE user_id = ? 
+            WHERE chat_id = ? 
             ORDER BY timestamp DESC 
             LIMIT ?
-        ''', (user_id, limit))
+        ''', (chat_id, limit))
         result = cursor.fetchall()
         return [{"role": role, "content": content} for role, content in reversed(result)]
 
-    def clear_history(self, user_id: int):
+    def clear_history(self, chat_id: int):
         cursor = self.conn.cursor()
-        cursor.execute('''
-            DELETE FROM history WHERE user_id = ?
-        ''', (user_id,))
+        cursor.execute('DELETE FROM history WHERE chat_id = ?', (chat_id,))
         self.conn.commit()
 
 db = Database()
@@ -87,70 +128,182 @@ MODELS = {
 
 class ChatStates(StatesGroup):
     choosing_model = State()
+    naming_chat = State()
+    renaming_chat = State()
     waiting_for_message = State()
+
+def main_menu_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.add(types.KeyboardButton(text="➕ Новый чат"))
+    builder.add(types.KeyboardButton(text="📂 Мои чаты"))
+    builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True)
 
 def model_selection_keyboard():
     builder = ReplyKeyboardBuilder()
     for model in MODELS.values():
         builder.add(types.KeyboardButton(text=model))
+    builder.add(types.KeyboardButton(text="↩️ Назад"))
     builder.adjust(1)
     return builder.as_markup(resize_keyboard=True)
 
+def chat_actions_keyboard(chat_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.add(types.InlineKeyboardButton(
+        text="✏️ Переименовать",
+        callback_data=f"rename_{chat_id}"
+    ))
+    builder.add(types.InlineKeyboardButton(
+        text="🗑️ Удалить",
+        callback_data=f"delete_{chat_id}"
+    ))
+    return builder.as_markup()
+
 @dp.message(F.text == "/start")
 async def cmd_start(message: types.Message, state: FSMContext):
+    await message.answer("🤖 Добро пожаловать в нейро-чат!")
+    await message.answer(
+        "👇 Выберите действие:",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.message(F.text == "/menu")
+async def cmd_menu(message: types.Message, state: FSMContext):
+    await message.answer(
+        "📝 Главное меню:",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.message(F.text == "➕ Новый чат")
+async def create_new_chat(message: types.Message, state: FSMContext):
     await state.set_state(ChatStates.choosing_model)
     await message.answer(
-        "🤖 Привет! Выберите модель:",
+        "🤖 Выберите модель для нового чата:",
         reply_markup=model_selection_keyboard()
     )
 
 @dp.message(F.text.in_(MODELS.values()), ChatStates.choosing_model)
 async def model_selected(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    model_key = [k for k, v in MODELS.items() if v == message.text][0]
+    model_key = next(k for k, v in MODELS.items() if v == message.text)
+    await state.update_data(selected_model=model_key)
+    await state.set_state(ChatStates.naming_chat)
+    await message.answer(
+        "📝 Введите название для нового чата:",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+@dp.message(ChatStates.naming_chat)
+async def chat_named(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    model = data['selected_model']
+    title = message.text[:30]  # Ограничение длины названия
     
-    await state.update_data(model=model_key)
+    chat_id = db.create_chat(message.from_user.id, model, title)
+    await state.update_data(current_chat=chat_id)
     await state.set_state(ChatStates.waiting_for_message)
     await message.answer(
-        f"✅ Выбрана модель: {message.text}\nТеперь вы можете начать общение!",
+        f"✅ Чат '{title}' создан!\nТеперь вы можете начать общение!",
+        reply_markup=main_menu_keyboard()
+    )
+
+@dp.message(F.text == "📂 Мои чаты")
+async def show_chats(message: types.Message):
+    user_id = message.from_user.id
+    chats = db.get_chats(user_id)
+    
+    if not chats:
+        await message.answer("📭 У вас пока нет сохраненных чатов")
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for chat in chats:
+        builder.row(types.InlineKeyboardButton(
+            text=f"{chat[1]} ({chat[2]})",
+            callback_data=f"chat_{chat[0]}"
+        ))
+        builder.row(types.InlineKeyboardButton(
+            text="✏️ Переименовать",
+            callback_data=f"rename_{chat[0]}"
+        ), types.InlineKeyboardButton(
+            text="🗑️ Удалить",
+            callback_data=f"delete_{chat[0]}"
+        ))
+    
+    await message.answer(
+        "📂 Ваши чаты:",
+        reply_markup=builder.as_markup()
+    )
+
+@dp.callback_query(F.data.startswith("chat_"))
+async def select_chat(callback: types.CallbackQuery, state: FSMContext):
+    chat_id = int(callback.data.split("_")[1])
+    await state.update_data(current_chat=chat_id)
+    await callback.message.answer(
+        "✅ Переключено на выбранный чат",
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_"))
+async def delete_chat(callback: types.CallbackQuery):
+    chat_id = int(callback.data.split("_")[1])
+    db.delete_chat(chat_id)
+    await callback.message.edit_text(f"✅ Чат успешно удален")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("rename_"))
+async def rename_chat_start(callback: types.CallbackQuery, state: FSMContext):
+    chat_id = int(callback.data.split("_")[1])
+    await state.set_state(ChatStates.renaming_chat)
+    await state.update_data(renaming_chat=chat_id)
+    await callback.message.answer(
+        "📝 Введите новое название для чата:",
         reply_markup=types.ReplyKeyboardRemove()
+    )
+    await callback.answer()
+
+@dp.message(ChatStates.renaming_chat)
+async def rename_chat_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    chat_id = data['renaming_chat']
+    new_title = message.text[:30]
+    
+    db.rename_chat(chat_id, new_title)
+    await state.clear()
+    await message.answer(
+        f"✅ Название чата изменено на '{new_title}'",
+        reply_markup=main_menu_keyboard()
     )
 
 @dp.message(F.text == "/clear")
 async def clear_history(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    db.clear_history(user_id)
-    await state.set_state(ChatStates.choosing_model)
-    await message.answer(
-        "История очищена. Выберите модель:",
-        reply_markup=model_selection_keyboard()
-    )
+    data = await state.get_data()
+    chat_id = data.get('current_chat')
+    if chat_id:
+        db.clear_history(chat_id)
+        await message.answer("✅ История текущего чата очищена")
+    else:
+        await message.answer("❌ Нет активного чата")
 
 @dp.message(F.text, ChatStates.waiting_for_message)
 async def handle_message(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
     data = await state.get_data()
-    model = data.get('model')
+    chat_id = data.get('current_chat')
     
-    if not model:
-        await message.answer("Сначала выберите модель!")
+    if not chat_id:
+        await message.answer("❌ Сначала выберите или создайте чат!")
         return
     
-    db.add_message(user_id, "user", message.text)
+    db.add_message(chat_id, "user", message.text)
     
     try:
-        history = db.get_history(user_id)
-        sent_message = await message.answer("▌")
+        history = db.get_history(chat_id)
+        model = next(c[2] for c in db.get_chats(message.from_user.id) if c[0] == chat_id)
+        
+        sent_message = await message.answer("●")
         full_answer = ""
         last_edit_time = time.monotonic()
         edit_interval = 1.5
-        event = asyncio.Event()
-        thinking_task = None
-        
-        if model == "deepseek/deepseek-r1:free":
-            thinking_task = asyncio.create_task(
-                show_thinking_indication(sent_message, event)
-            )
         
         stream = await client.chat.completions.create(
             model=model,
@@ -162,72 +315,24 @@ async def handle_message(message: types.Message, state: FSMContext):
             }
         )
         
-        first_chunk = True
         async for chunk in stream:
-            if first_chunk:
-                event.set()
-                if thinking_task and not thinking_task.done():
-                    thinking_task.cancel()
-                first_chunk = False
-            
             if chunk.choices[0].delta.content:
                 delta_content = chunk.choices[0].delta.content
                 full_answer += delta_content
                 now = time.monotonic()
                 if now - last_edit_time >= edit_interval or len(delta_content) < 3:
                     try:
-                        await sent_message.edit_text(full_answer + "▌")
+                        await sent_message.edit_text(full_answer + "●")
                         last_edit_time = now
                     except Exception as e:
-                        error_str = str(e)
-                        if "Too Many Requests" in error_str:
-                            wait_time = 1
-                            try:
-                                import re
-                                match = re.search(r"retry after (\d+)", error_str)
-                                if match:
-                                    wait_time = int(match.group(1))
-                            except Exception:
-                                pass
-                            await asyncio.sleep(wait_time)
-                            try:
-                                await sent_message.edit_text(full_answer + "▌")
-                                last_edit_time = time.monotonic()
-                            except Exception as inner_e:
-                                logger.error(f"Ошибка повторного обновления: {inner_e}")
-                        else:
-                            logger.error(f"Ошибка при обновлении сообщения: {e}")
+                        logger.error(f"Ошибка при обновлении сообщения: {e}")
         
         await sent_message.edit_text(full_answer)
-        db.add_message(user_id, "assistant", full_answer)
-        
-        cursor = db.conn.cursor()
-        cursor.execute('''
-            DELETE FROM history 
-            WHERE rowid NOT IN (
-                SELECT rowid FROM history 
-                WHERE user_id = ? 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            )
-        ''', (user_id, HISTORY_LIMIT))
-        db.conn.commit()
+        db.add_message(chat_id, "assistant", full_answer)
         
     except Exception as e:
         logger.error(f"Ошибка: {str(e)}")
         await message.answer("⚠️ Произошла ошибка при обработке запроса")
-        if thinking_task and not thinking_task.done():
-            thinking_task.cancel()
-
-async def show_thinking_indication(sent_message: types.Message, event: asyncio.Event):
-    try:
-        await asyncio.sleep(2)
-        if not event.is_set():
-            await sent_message.edit_text("🤔 думаю...")
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.error(f"Ошибка в задаче Thinking: {e}")
 
 if __name__ == "__main__":
     asyncio.run(dp.start_polling(bot))
