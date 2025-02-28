@@ -53,6 +53,14 @@ class Database:
                 timestamp DATETIME
             )
         ''')
+        # Таблица для избранных моделей
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id INTEGER,
+                model_id TEXT,
+                PRIMARY KEY (user_id, model_id)
+            )
+        ''')
         self.conn.commit()
 
     def create_chat(self, user_id: int, model: str, title: str):
@@ -106,9 +114,27 @@ class Database:
         result = cursor.fetchall()
         return [{"role": role, "content": content} for role, content in reversed(result)]
 
-    def clear_history(self, chat_id: int):
+    # Метод для удаления всех чатов пользователя
+    def delete_all_chats(self, user_id: int):
+        chats = self.get_chats(user_id)
+        for chat in chats:
+            self.delete_chat(chat[0])
+
+    # Методы для работы с избранными моделями
+    def get_favorites(self, user_id: int):
         cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM history WHERE chat_id = ?', (chat_id,))
+        cursor.execute('SELECT model_id FROM favorites WHERE user_id = ?', (user_id,))
+        rows = cursor.fetchall()
+        return [row[0] for row in rows]
+
+    def add_favorite(self, user_id: int, model_id: str):
+        cursor = self.conn.cursor()
+        cursor.execute('INSERT OR IGNORE INTO favorites (user_id, model_id) VALUES (?, ?)', (user_id, model_id))
+        self.conn.commit()
+
+    def remove_favorite(self, user_id: int, model_id: str):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM favorites WHERE user_id = ? AND model_id = ?', (user_id, model_id))
         self.conn.commit()
 
 db = Database()
@@ -121,7 +147,7 @@ client = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY,
 )
 
-# Инициализация словаря моделей как пустого (будет заполнен динамически)
+# Словарь моделей с дополнительной информацией (имя и поддержка фото/документов)
 MODELS = {}
 
 # Получение списка доступных моделей
@@ -134,11 +160,16 @@ async def get_available_models():
         logger.error(f"Ошибка при получении списка моделей: {e}")
         return []
 
-# Обновление словаря MODELS
+# Обновление словаря MODELS с указанием поддержки мультимодальности
 async def update_models():
     global MODELS
     available_models = await get_available_models()
-    MODELS = {model: model.split('/')[-1].replace(':free', '') for model in available_models}
+    MULTIMODAL_INDICATORS = ["gpt-4", "multimodal", "vision"]
+    MODELS = {}
+    for model in available_models:
+        short_name = model.split('/')[-1].replace(':free', '')
+        is_multimodal = any(ind in short_name.lower() for ind in MULTIMODAL_INDICATORS)
+        MODELS[model] = {"name": short_name, "multimodal": is_multimodal}
 
 # Запуск обновления моделей при старте
 asyncio.run(update_models())
@@ -149,23 +180,74 @@ class ChatStates(StatesGroup):
     renaming_chat = State()
     waiting_for_message = State()
 
+# Главное меню (убрана кнопка очистки истории, добавлена кнопка настроек)
 def main_menu_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.add(types.KeyboardButton(text="➕ Новый чат"))
     builder.add(types.KeyboardButton(text="📂 Мои чаты"))
     builder.add(types.KeyboardButton(text="📊 Текущий чат"))
-    builder.add(types.KeyboardButton(text="🧹 Очистить историю"))
     builder.add(types.KeyboardButton(text="📤 Экспорт истории"))
-    builder.adjust(2, 2)
+    builder.add(types.KeyboardButton(text="⚙️ Настройки"))
+    builder.adjust(2, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
-def model_selection_keyboard():
+# Клавиатура выбора модели с учётом избранных и сортировкой по папкам
+def model_selection_keyboard(user_id: int):
     builder = ReplyKeyboardBuilder()
-    for model in MODELS.values():
-        builder.add(types.KeyboardButton(text=model))
+    favorites = db.get_favorites(user_id)
+    favorite_models = []
+    other_models = {}
+    
+    for model_key, model_data in MODELS.items():
+        if model_key in favorites:
+            favorite_models.append((model_key, model_data))
+        else:
+            folder = model_data["name"].split('-')[0]  # Assuming folder is determined by prefix
+            if folder not in other_models:
+                other_models[folder] = []
+            other_models[folder].append((model_key, model_data))
+    
+    favorite_models.sort(key=lambda x: x[1]["name"])
+    for folder in other_models:
+        other_models[folder].sort(key=lambda x: x[1]["name"])
+    
+    if favorite_models:
+        builder.add(types.KeyboardButton(text="⭐ Избранное"))
+        for model_key, model_data in favorite_models:
+            display = model_data["name"]
+            if model_data["multimodal"]:
+                display += " 🖼️"
+            builder.add(types.KeyboardButton(text=display))
+    
+    for folder, models in other_models.items():
+        builder.add(types.KeyboardButton(text=f"📁 {folder}"))
+        for model_key, model_data in models:
+            display = model_data["name"]
+            if model_data["multimodal"]:
+                display += " 🖼️"
+            builder.add(types.KeyboardButton(text=display))
+    
     builder.add(types.KeyboardButton(text="↩️ Назад"))
     builder.adjust(1)
     return builder.as_markup(resize_keyboard=True)
+
+# Клавиатура настроек
+def settings_menu_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="Избранные модели", callback_data="settings_favorites"))
+    builder.row(types.InlineKeyboardButton(text="↩️ Назад", callback_data="settings_back"))
+    return builder.as_markup()
+
+# Клавиатура для выбора избранных моделей с улучшенным отображением
+def favorite_models_keyboard(user_id: int):
+    builder = InlineKeyboardBuilder()
+    favorites = db.get_favorites(user_id)
+    for model_key, model_data in MODELS.items():
+        is_fav = model_key in favorites
+        text = f"{model_data['name']} {'✅' if is_fav else '❌'}"
+        builder.row(types.InlineKeyboardButton(text=text, callback_data=f"toggle_fav_{model_key}"))
+    builder.row(types.InlineKeyboardButton(text="↩️ Назад", callback_data="settings_back"))
+    return builder.as_markup()
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -190,15 +272,25 @@ async def create_new_chat(message: types.Message, state: FSMContext):
     await state.set_state(ChatStates.choosing_model)
     await message.answer(
         "🤖 Выберите модель для нового чата:",
-        reply_markup=model_selection_keyboard()
+        reply_markup=model_selection_keyboard(message.from_user.id)
     )
 
-@dp.message(F.text.in_(MODELS.values()), ChatStates.choosing_model)
+@dp.message(ChatStates.choosing_model)
 async def model_selected(message: types.Message, state: FSMContext):
-    selected_model_name = message.text
-    model_key = next((k for k, v in MODELS.items() if v == selected_model_name), None)
-    if model_key:
-        await state.update_data(selected_model=model_key)
+    # Если пользователь нажал "↩️ Назад"
+    if message.text == "↩️ Назад":
+        await state.clear()
+        await message.answer("↩️ Отмена создания нового чата", reply_markup=main_menu_keyboard())
+        return
+
+    selected_text = message.text.replace(" 🖼️", "")
+    selected_model_key = None
+    for model_key, model_data in MODELS.items():
+        if model_data["name"] == selected_text:
+            selected_model_key = model_key
+            break
+    if selected_model_key:
+        await state.update_data(selected_model=selected_model_key)
         await state.set_state(ChatStates.naming_chat)
         await message.answer(
             "📝 Введите название для нового чата:",
@@ -232,21 +324,25 @@ async def show_chats(message: types.Message):
     
     builder = InlineKeyboardBuilder()
     for chat in chats:
-        model_display = MODELS.get(chat[2], chat[2])  # Если модель неизвестна, показываем ключ
+        model_info = MODELS.get(chat[2])
+        if model_info:
+            model_display = model_info["name"]
+            if model_info["multimodal"]:
+                model_display += " 🖼️"
+        else:
+            model_display = chat[2]
         builder.row(types.InlineKeyboardButton(
             text=f"{chat[1]} ({model_display})",
             callback_data=f"chat_{chat[0]}"
         ))
-        builder.row(types.InlineKeyboardButton(
-            text="✏️ Переименовать",
-            callback_data=f"rename_{chat[0]}"
-        ), types.InlineKeyboardButton(
-            text="🗑️ Удалить",
-            callback_data=f"delete_{chat[0]}"
-        ))
+        builder.row(
+            types.InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"rename_{chat[0]}"),
+            types.InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"delete_{chat[0]}")
+        )
+    # Добавлена кнопка для удаления всех чатов
     builder.row(types.InlineKeyboardButton(
-        text="♻️ Обновить",
-        callback_data="refresh_chats"
+        text="🗑️ Удалить все чаты",
+        callback_data="delete_all_chats"
     ))
     
     await message.answer(
@@ -263,11 +359,13 @@ async def refresh_chats(callback: types.CallbackQuery):
 async def select_chat(callback: types.CallbackQuery, state: FSMContext):
     chat_id = int(callback.data.split("_")[1])
     await state.update_data(current_chat=chat_id)
+    await state.set_state(ChatStates.waiting_for_message)  # Устанавливаем нужное состояние
     await callback.message.answer(
         "✅ Переключено на выбранный чат",
         reply_markup=main_menu_keyboard()
     )
     await callback.answer()
+
 
 @dp.message(F.text == "📊 Текущий чат")
 async def show_current_chat(message: types.Message, state: FSMContext):
@@ -277,7 +375,10 @@ async def show_current_chat(message: types.Message, state: FSMContext):
         chats = db.get_chats(message.from_user.id)
         chat_info = next((c for c in chats if c[0] == chat_id), None)
         if chat_info:
-            model_display = MODELS.get(chat_info[2], chat_info[2])
+            model_info = MODELS.get(chat_info[2])
+            model_display = model_info["name"] if model_info else chat_info[2]
+            if model_info and model_info["multimodal"]:
+                model_display += " 🖼️"
             await message.answer(f"🔮 Активный чат: {chat_info[1]}\nМодель: {model_display}")
             return
     await message.answer("❌ Нет активного чата")
@@ -318,7 +419,14 @@ async def handle_message(message: types.Message, state: FSMContext):
         await message.answer("❌ Сначала выберите или создайте чат!")
         return
     
-    db.add_message(chat_id, "user", message.text)
+    # Если к сообщению прикреплены фото или документы – добавляем примечание
+    content = message.text
+    if message.photo:
+        content += "\n[Прикреплено фото]"
+    if message.document:
+        content += "\n[Прикреплен документ]"
+        
+    db.add_message(chat_id, "user", content)
     
     try:
         chats = db.get_chats(message.from_user.id)
@@ -338,7 +446,7 @@ async def handle_message(message: types.Message, state: FSMContext):
         
         stream = await client.chat.completions.create(
             model=model_key,
-            messages=history + [{"role": "user", "content": message.text}],
+            messages=history + [{"role": "user", "content": content}],
             stream=True,
             extra_headers={
                 "HTTP-Referer": "https://github.com/Purpose-arch/tgbotaimult",
@@ -376,9 +484,24 @@ async def handle_message(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("delete_"))
 async def delete_chat(callback: types.CallbackQuery):
-    chat_id = int(callback.data.split("_")[1])
+    if callback.data == "delete_all_chats":
+        # Этот случай уже обрабатывается отдельным хендлером, поэтому просто выходим
+        return
+    try:
+        chat_id = int(callback.data.split("_")[1])
+    except ValueError:
+        await callback.answer("Некорректный идентификатор чата")
+        return
     db.delete_chat(chat_id)
-    await callback.message.edit_text(f"✅ Чат успешно удален")
+    await callback.message.edit_text("✅ Чат успешно удален")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "delete_all_chats")
+async def delete_all_chats(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    db.delete_all_chats(user_id)
+    await callback.message.edit_text("✅ Все чаты успешно удалены")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("rename_"))
@@ -405,15 +528,38 @@ async def rename_chat_finish(message: types.Message, state: FSMContext):
         reply_markup=main_menu_keyboard()
     )
 
-@dp.message(F.text == "🧹 Очистить историю")
-async def clear_history(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    chat_id = data.get('current_chat')
-    if chat_id:
-        db.clear_history(chat_id)
-        await message.answer("✅ История текущего чата очищена")
+# Обработчик настроек
+@dp.message(F.text == "⚙️ Настройки")
+async def settings_menu(message: types.Message):
+    await message.answer(
+        "⚙️ Настройки:",
+        reply_markup=settings_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "settings_back")
+async def settings_back(callback: types.CallbackQuery):
+    await callback.message.edit_text("📝 Главное меню:", reply_markup=main_menu_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "settings_favorites")
+async def settings_favorites(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    keyboard = favorite_models_keyboard(user_id)
+    await callback.message.edit_text("⭐ Выберите избранные модели (нажмите для переключения):", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("toggle_fav_"))
+async def toggle_favorite(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    model_key = callback.data[len("toggle_fav_"):]
+    favorites = db.get_favorites(user_id)
+    if model_key in favorites:
+        db.remove_favorite(user_id, model_key)
     else:
-        await message.answer("❌ Нет активного чата")
+        db.add_favorite(user_id, model_key)
+    keyboard = favorite_models_keyboard(user_id)
+    await callback.message.edit_text("⭐ Выберите избранные модели (нажмите для переключения):", reply_markup=keyboard)
+    await callback.answer("Избранное переключено")
 
 if __name__ == "__main__":
     asyncio.run(dp.start_polling(bot))
